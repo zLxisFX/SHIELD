@@ -186,6 +186,10 @@ def _apply_smoke_guard_to_actions(
 
         note = f"Override: windows CLOSED (outdoor PM {f.pm25_out:.1f} > {pm_open_max:.1f})"
         notes = list(getattr(a, "notes", []) or [])
+
+        # If we override to CLOSED, remove any earlier "open" notes to avoid contradictions
+        notes = [n for n in (notes or []) if "windows OPEN" not in n and "Ventilate (windows OPEN)" not in n]
+
         notes.append(note)
 
         # Dataclass-safe override (works if Action is frozen or mutable)
@@ -322,6 +326,7 @@ def simulate_demo(
             heat_threshold_c=heat_threshold_c,
             pm25_init=pm25_init,
             temp_init_c=temp_init_c,
+            hepa_budget_h_per_day=hepa_budget_h_per_day,
             **kw,
         )
 

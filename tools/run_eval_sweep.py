@@ -7,7 +7,7 @@ import json
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 def _now_stamp() -> str:
@@ -27,7 +27,27 @@ def _write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
         path.write_text("", encoding="utf-8")
         return
 
-    common = ["policy", "pm_over_min", "heat_over_h", "hepa_hours", "fan_hours", "window_open_hours", "effort_score"]
+    # Prefer common columns first
+    common = [
+        "scenario",
+        "archetype",
+        "area_m2",
+        "start_hour",
+        "horizon_hours",
+        "hepa_budget_h_per_day",
+        "seed",
+        "policy",
+        "pm_over_min",
+        "heat_over_h",
+        "hepa_hours",
+        "fan_hours",
+        "window_open_hours",
+        "effort_score",
+        "pm_pct_vs_ref",
+        "heat_pct_vs_ref",
+        "effort_pct_vs_ref",
+        "ref_policy",
+    ]
     keys = sorted({k for r in rows for k in r.keys()})
     header: List[str] = []
     for k in common:
@@ -56,10 +76,6 @@ def _write_json(path: Path, payload: Any) -> None:
 
 
 def _pick_scenario_obj(scenarios_mod: Any, scenario_name: str) -> Any:
-    """
-    Try to select a DemoScenario object from list_demo_scenarios().
-    If no match, return None and caller can decide whether to pass a string.
-    """
     if not hasattr(scenarios_mod, "list_demo_scenarios"):
         return None
     try:
@@ -73,15 +89,13 @@ def _pick_scenario_obj(scenarios_mod: Any, scenario_name: str) -> Any:
         nm = getattr(s, "name", None) or getattr(s, "id", None) or getattr(s, "scenario", None)
         if nm and str(nm) == str(scenario_name):
             return s
-
     return None
 
 
 def _make_demo_forcing_compat(scenario_name: str, start_hour: int, horizon_hours: int = 72) -> List[Any]:
     """
-    Supports your current signature:
+    Supports current signature:
       make_demo_forcing(start: datetime, horizon_hours: int, scenario: DemoScenario) -> List[ForcingHour]
-    Plus a couple of legacy fallbacks.
     """
     import shield.demo.scenarios as sc
 
@@ -95,32 +109,13 @@ def _make_demo_forcing_compat(scenario_name: str, start_hour: int, horizon_hours
     if params[:3] == ["start", "horizon_hours", "scenario"]:
         scen_obj = _pick_scenario_obj(sc, scenario_name)
         if scen_obj is None:
-            # if they changed list behavior, we can still try passing the string
             scen_obj = str(scenario_name)
 
-        # Keep consistent with your demo runs
         start_dt = datetime(2026, 1, 16, int(start_hour), 0, 0)
         out = fn(start_dt, int(horizon_hours), scen_obj)
         return list(out)
 
-    # Legacy fallbacks (older conventions)
-    for args in [(scenario_name, start_hour), (start_hour, scenario_name)]:
-        try:
-            out = fn(*args)
-            if out:
-                return list(out)
-        except TypeError:
-            pass
-
-    for kwargs in [{"scenario": scenario_name, "start_hour": start_hour}, {"start_hour": start_hour, "scenario": scenario_name}]:
-        try:
-            out = fn(**kwargs)
-            if out:
-                return list(out)
-        except TypeError:
-            pass
-
-    raise TypeError(f"Could not call shield.demo.scenarios.make_demo_forcing() with known conventions. signature={sig}")
+    raise TypeError(f"Unsupported make_demo_forcing signature: {sig}")
 
 
 def _make_building_compat(
@@ -131,10 +126,6 @@ def _make_building_compat(
     has_fan: bool = True,
     occupants: int = 25,
 ) -> Any:
-    """
-    Construct BuildingProfile even if its field names evolve.
-    Supplies required args by matching parameter names.
-    """
     import shield.core.state as st
 
     if not hasattr(st, "BuildingProfile"):
@@ -284,6 +275,12 @@ def main() -> int:
     ap.add_argument("--opt-cvar", type=float, default=0.90)
 
     ap.add_argument("--outdir", type=str, default="outputs", help="where to write eval csv/json")
+    
+    # HTML report options
+    ap.add_argument("--no-html-report", action="store_true", help="disable HTML report output")
+    ap.add_argument("--report-policy", type=str, default="robust", help="policy to feature in the HTML report")
+    ap.add_argument("--open-report", action="store_true", help="open the HTML report after writing it")
+
     args = ap.parse_args()
 
     from shield.evaluation.runner import evaluate_policies
@@ -351,6 +348,47 @@ def main() -> int:
     _write_json(json_path, {"rows": rows, "results": results, "robust_kwargs": robust_kwargs})
 
     print(f"Wrote:\n- {csv_path}\n- {json_path}")
+
+    # Optional: write a judge-friendly HTML report
+    if not getattr(args, "no_html_report", False):
+        try:
+            from shield.reporting.html_report import write_html_report
+            import webbrowser
+
+            report_path = outdir / (
+                f"report_{scenario}_{archetype}_A{int(area)}_H{start_hour}_M{int(args.members)}_{stamp}.html"
+            )
+
+            meta = {
+                "scenario": scenario,
+                "archetype": archetype,
+                "area_m2": area,
+                "start_hour": start_hour,
+                "horizon_hours": int(args.horizon_hours),
+                "members": int(args.members),
+                "seed": int(args.seed),
+                "hepa_budget_h_per_day": ("unlimited" if hepa_budget_h_per_day is None else hepa_budget_h_per_day),
+                "robust_kwargs": _safe_str(robust_kwargs),
+                "csv_path": str(csv_path),
+                "json_path": str(json_path),
+            }
+
+            write_html_report(
+                report_path,
+                rows=rows,
+                results=results,
+                meta=meta,
+                focus_policy=getattr(args, "report_policy", "robust"),
+                ref_policy="heuristic",
+            )
+
+            print(f"- {report_path}")
+            if getattr(args, "open_report", False):
+                webbrowser.open(report_path.resolve().as_uri())
+
+        except Exception as e:
+            print(f"[warn] Failed to write HTML report: {e}")
+
     return 0
 
 

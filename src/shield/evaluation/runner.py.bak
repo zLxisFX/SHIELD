@@ -1,0 +1,229 @@
+"""
+Evaluation runner: compare multiple policies on the same forcing + building.
+
+- Self-contained (no imports from non-existent modules)
+- evaluate_policies() is what tests import
+- policy_table_string() formats a stable table
+- export_eval_json() writes a reproducible artifact
+
+Percent vs reference is computed as "improvement" where:
++ means better (lower is better), - means worse.
+
+If reference is 0:
+- if policy is also 0 -> 0%
+- if policy > 0 -> -999% (capped for readability)
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+from dataclasses import asdict, is_dataclass
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from shield.engine.simulate import simulate_demo
+
+
+def _safe_improvement_percent(ref: float, val: float) -> float:
+    """
+    Percent improvement vs reference for "lower is better" metrics.
+    + = improvement, - = worse.
+    """
+    ref = float(ref)
+    val = float(val)
+
+    if ref <= 0.0:
+        if val <= 0.0:
+            return 0.0
+        return -999.0
+
+    return 100.0 * (ref - val) / ref
+
+
+def policy_table_string(rows: List[Dict[str, Any]], eval_ref: str) -> str:
+    """
+    Format rows into a stable plain-text table:
+    Policy | PM minutes | Heat hours | PM % vs ref | Heat % vs ref
+    """
+    col_policy = max(6, max((len(str(r.get("policy", ""))) for r in rows), default=6))
+    col_pm = 10
+    col_heat = 9
+    col_pm_pct = 11
+    col_heat_pct = 13
+
+    def fmt_pct(x: float) -> str:
+        if x <= -999.0:
+            return "-999.0%"
+        return f"{x:+.1f}%"
+
+    header = (
+        f"{'Policy':<{col_policy}} | "
+        f"{'PM minutes':>{col_pm}} | "
+        f"{'Heat hours':>{col_heat}} | "
+        f"{'PM % vs ref':>{col_pm_pct}} | "
+        f"{'Heat % vs ref':>{col_heat_pct}}"
+    )
+    sep = (
+        f"{'-'*col_policy}-+-"
+        f"{'-'*col_pm}-+-"
+        f"{'-'*col_heat}-+-"
+        f"{'-'*col_pm_pct}-+-"
+        f"{'-'*col_heat_pct}"
+    )
+
+    lines = [header, sep]
+    for r in rows:
+        pol = str(r.get("policy", ""))
+        pm = int(r.get("pm_minutes", 0))
+        heat = int(r.get("heat_hours", 0))
+        pm_pct = float(r.get("pm_pct_vs_ref", 0.0))
+        heat_pct = float(r.get("heat_pct_vs_ref", 0.0))
+
+        lines.append(
+            f"{pol:<{col_policy}} | "
+            f"{pm:>{col_pm}d} | "
+            f"{heat:>{col_heat}d} | "
+            f"{fmt_pct(pm_pct):>{col_pm_pct}} | "
+            f"{fmt_pct(heat_pct):>{col_heat_pct}}"
+        )
+
+    return "\n".join(lines)
+
+
+def evaluate_policies(
+    forcing: List[Dict[str, float]],
+    building: Any,
+    *,
+    policies: Optional[List[str]] = None,
+    eval_ref: str = "heuristic",
+    robust_kwargs: Optional[Dict[str, Any]] = None,
+    include_baselines: bool = True,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Evaluate a set of policies and return:
+      - rows: list of dicts for printing and JSON
+      - results: dict of policy -> run object returned by simulate_demo()
+    """
+    if policies is None:
+        if include_baselines:
+            policies = ["robust", "always_closed", "hepa_always", "heuristic", "night_vent", "always_open"]
+        else:
+            policies = ["robust", "heuristic"]
+
+    rk = dict(robust_kwargs or {})
+
+    policy_map: Dict[str, Tuple[str, Dict[str, Any]]] = {
+        "robust": ("robust_greedy", rk),
+        "always_closed": ("always_closed", {}),
+        "hepa_always": ("hepa_always", {}),
+        "heuristic": ("heuristic", {}),
+        "night_vent": ("night_vent", {}),
+        "always_open": ("always_open", {}),
+    }
+
+    results: Dict[str, Any] = {}
+    for name in policies:
+        engine_policy, kwargs = policy_map.get(name, (name, {}))
+        results[name] = simulate_demo(forcing, building, policy=engine_policy, policy_kwargs=kwargs)
+
+    if eval_ref not in results:
+        eval_ref = "heuristic"
+    # Ensure reference run exists if not in policy list
+    if eval_ref not in results:
+        engine_policy, kwargs = policy_map.get(eval_ref, (eval_ref, {}))
+        results[eval_ref] = simulate_demo(forcing, building, policy=engine_policy, policy_kwargs=kwargs)
+        
+    ref_run = results[eval_ref]
+
+    rows: List[Dict[str, Any]] = []
+    # Only report rows for requested policies
+    for name in policies:
+        r = results[name]
+
+        pm_val = float(getattr(r, "minutes_pm25_above_threshold"))
+        heat_val = float(getattr(r, "hours_heat_above_threshold"))
+
+        pm = int(pm_val)
+        heat = int(heat_val)
+
+        pm_pct = _safe_improvement_percent(float(getattr(ref_run, "minutes_pm25_above_threshold")), pm_val)
+        heat_pct = _safe_improvement_percent(float(getattr(ref_run, "hours_heat_above_threshold")), heat_val)
+
+        rows.append(
+            {
+                "policy": name,
+                "pm_minutes": pm,
+                "heat_hours": heat,
+                "pm_pct_vs_ref": pm_pct,
+                "heat_pct_vs_ref": heat_pct,
+                # extra aliases (in case any older code/tests look for these)
+                "pm_percent_vs_ref": pm_pct,
+                "heat_percent_vs_ref": heat_pct,
+            }
+        )
+
+    return rows, results
+
+
+def _to_jsonable(x: Any) -> Any:
+    """Recursively convert objects into JSON-serializable forms."""
+    if isinstance(x, (datetime, date)):
+        return x.isoformat()
+    if isinstance(x, Path):
+        return str(x)
+    if dataclasses.is_dataclass(x):
+        return _to_jsonable(dataclasses.asdict(x))
+    if isinstance(x, dict):
+        return {str(k): _to_jsonable(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_to_jsonable(v) for v in x]
+    # basic JSON types
+    if isinstance(x, (str, int, float, bool)) or x is None:
+        return x
+    # fallback: stringify unknown objects
+    return str(x)
+
+
+def export_eval_json(rows, results, out_dir: str = "outputs") -> str:
+    """
+    Export evaluation results to JSON.
+
+    We store:
+      - rows (table-friendly summary)
+      - results (full SimulationRun objects, converted to JSONable dicts)
+    """
+    import json  # keep local to avoid import-order surprises
+
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out = out_path / f"shield_eval_{ts}.json"
+
+    payload = {
+        "rows": _to_jsonable(rows),
+        "results": _to_jsonable(results),
+        "exported_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+    out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return str(out)
+
+
+def main() -> None:
+    from shield.demo.scenarios import make_demo_forcing
+    from shield.core.state import BuildingProfile
+
+    forcing = make_demo_forcing(start=datetime(2026, 1, 15, 0, 0), horizon_hours=72, scenario="smoke_heat_day")
+    building = BuildingProfile(archetype="classroom", floor_area_m2=90.0, has_hepa=True, has_fan=True, occupants=25)
+
+    rows, results = evaluate_policies(forcing, building, robust_kwargs={"n_ensemble": 60, "seed": 123})
+    print(policy_table_string(rows, eval_ref="heuristic"))
+    out = export_eval_json(rows, results)
+    print(f"\nExported eval JSON: {out}")
+
+
+if __name__ == "__main__":
+    main()

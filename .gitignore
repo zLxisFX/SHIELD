@@ -211,3 +211,7 @@ outputs/
 
 # SHIELD scratch/backup artifacts
 *.bak_guard
+
+# SHIELD local backups
+*.bak_*
+*.bak
